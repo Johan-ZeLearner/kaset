@@ -1220,7 +1220,7 @@ The spike code in `main.swift` is at file-scope (top-level functions, not method
 | A7 | `ffmpeg` is acceptable to use for fixture generation (one-time, not a runtime dep) | Section 5 (test content fixtures) | LOW — fixture generation is a developer task; ffmpeg is industry-standard. The fixtures are committed to git, not generated at spike runtime. |
 | A8 | The user's terminal/`swift run` invocation is not sandboxed | Section 3 (D-05 + Pitfall 5) | LOW — Terminal.app and iTerm2 are unsandboxed by default. Apple Store terminal apps may be sandboxed, but the user is presumed to use a standard developer tool. |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **OQ-1: Does the CLI process inherit the user's TCC grant for "Screen & System Audio Recording"?**
    - What we know: Tap creation requires the grant (`ProcessTapHelper.swift:134`). The user has presumably granted `Kaset.app` this permission.
