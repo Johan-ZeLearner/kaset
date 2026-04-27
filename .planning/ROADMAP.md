@@ -30,7 +30,13 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Static test audio file plays out of the user's actual Sonos S1 hardware via hand-built `SetAVTransportURI` + `Play` for >5 minutes uninterrupted
   4. Pause-to-silence latency measured against the user's actual Sonos hardware with a stopwatch (5 trials, median reported)
   5. Spike report committed at `.planning/phases/01-spike/REPORT.md` with explicit go/no-go on each of SPIKE-02 / SPIKE-03 / SPIKE-04 / SPIKE-05 plus chosen encoder format (AAC-in-ADTS / WAV / vendor-LAME-with-approval) and SSDP transport decision (`NWConnectionGroup` vs BSD socket fallback)
-**Plans**: TBD
+**Plans**: 6 plans
+  - [ ] 01-01-PLAN.md — Day-1 entitlement filing + api-explorer `sonos` dispatcher scaffold + WAV/AAC fixtures
+  - [ ] 01-02-PLAN.md — SPIKE-04 SSDP discovery via NWConnectionGroup with BSD socket fallback
+  - [ ] 01-03-PLAN.md — SPIKE-03 NWListener HTTP/1.0 relay + SOAP-driven Sonos playback (WAV first, AAC second)
+  - [ ] 01-04-PLAN.md — SPIKE-02 dual-consumer tap test via in-place fan-out at EqualizerAudioEngine.performRender (gated by #if SPIKE_TAP_COEXIST)
+  - [ ] 01-05-PLAN.md — SPIKE-05 5-trial manual-stopwatch pause-to-silence latency measurement
+  - [ ] 01-06-PLAN.md — SPIKE-06 thin spike-all runner + REPORT.md generation with full LAN-IP/USN redaction + milestone-level decision
 
 ### Phase 2: Foundation Refactor
 **Goal**: Refactor the existing `EqualizerService`-owned Core Audio process tap into a standalone `WebKitAudioTapCoordinator` with multi-consumer fan-out. This is **mandatory before any Sonos audio work** because adding a second independent tap on the same WebKit PIDs (`com.apple.WebKit.WebContent` / `com.apple.WebKit.GPU`) produces undefined HAL behavior. This phase ships standalone value to EQ regardless of Sonos outcome — it is independently mergeable.
