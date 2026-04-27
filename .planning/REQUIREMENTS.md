@@ -122,46 +122,51 @@ Explicit exclusions. The reasoning matters — these will be re-proposed otherwi
 
 ## Traceability
 
-Empty until roadmap creation populates it.
-
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| SPIKE-01 | TBD | Pending |
-| SPIKE-02 | TBD | Pending |
-| SPIKE-03 | TBD | Pending |
-| SPIKE-04 | TBD | Pending |
-| SPIKE-05 | TBD | Pending |
-| SPIKE-06 | TBD | Pending |
-| FOUND-01 | TBD | Pending |
-| FOUND-02 | TBD | Pending |
-| FOUND-03 | TBD | Pending |
-| FOUND-04 | TBD | Pending |
-| DISC-01 | TBD | Pending |
-| DISC-02 | TBD | Pending |
-| DISC-03 | TBD | Pending |
-| DISC-04 | TBD | Pending |
-| CTRL-01 | TBD | Pending |
-| CTRL-02 | TBD | Pending |
-| CTRL-03 | TBD | Pending |
-| CTRL-04 | TBD | Pending |
-| AUDIO-01 | TBD | Pending |
-| AUDIO-02 | TBD | Pending |
-| AUDIO-03 | TBD | Pending |
-| AUDIO-04 | TBD | Pending |
-| OUT-01 | TBD | Pending |
-| OUT-02 | TBD | Pending |
-| OUT-03 | TBD | Pending |
-| OUT-04 | TBD | Pending |
-| OUT-05 | TBD | Pending |
-| OUT-06 | TBD | Pending |
-| OUT-07 | TBD | Pending |
-| OUT-08 | TBD | Pending |
+| SPIKE-01 | Phase 1 | Pending |
+| SPIKE-02 | Phase 1 | Pending |
+| SPIKE-03 | Phase 1 | Pending |
+| SPIKE-04 | Phase 1 | Pending |
+| SPIKE-05 | Phase 1 | Pending |
+| SPIKE-06 | Phase 1 | Pending |
+| FOUND-01 | Phase 2 | Pending |
+| FOUND-02 | Phase 2 | Pending |
+| FOUND-03 | Phase 2 | Pending |
+| FOUND-04 | Phase 2 | Pending |
+| DISC-01 | Phase 3 | Pending |
+| DISC-02 | Phase 3 | Pending |
+| DISC-03 | Phase 3 | Pending |
+| DISC-04 | Phase 3 | Pending |
+| CTRL-01 | Phase 3 | Pending |
+| CTRL-02 | Phase 3 | Pending |
+| CTRL-03 | Phase 3 | Pending |
+| CTRL-04 | Phase 3 | Pending |
+| AUDIO-01 | Phase 4 | Pending |
+| AUDIO-02 | Phase 4 | Pending |
+| AUDIO-03 | Phase 4 | Pending |
+| AUDIO-04 | Phase 4 | Pending |
+| OUT-01 | Phase 5 | Pending |
+| OUT-02 | Phase 5 | Pending |
+| OUT-03 | Phase 5 | Pending |
+| OUT-04 | Phase 5 | Pending |
+| OUT-05 | Phase 5 | Pending |
+| OUT-06 | Phase 5 | Pending |
+| OUT-07 | Phase 5 | Pending |
+| OUT-08 | Phase 5 | Pending |
 
 **Coverage:**
 - v1 requirements: 30 total
-- Mapped to phases: 0
-- Unmapped: 30 ⚠️ (will be filled by roadmap)
+- Mapped to phases: 30
+- Unmapped: 0 ✓
+
+**Phase distribution:**
+- Phase 1 (Spike): 6 requirements
+- Phase 2 (Foundation Refactor): 4 requirements
+- Phase 3 (Discovery + Control Plane): 8 requirements
+- Phase 4 (Audio Capture + HTTP Relay): 4 requirements
+- Phase 5 (Output Integration UX): 8 requirements
 
 ---
 *Requirements defined: 2026-04-27*
-*Last updated: 2026-04-27 after initial definition*
+*Last updated: 2026-04-27 — traceability populated by initial roadmap creation*
