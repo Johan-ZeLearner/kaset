@@ -1489,12 +1489,420 @@ func detectMacLANIP() -> String? {
     return candidates.first
 }
 
+// MARK: - DiscoveredSonosDevice
+
+/// A single Sonos zone discovered via SSDP M-SEARCH.
+/// Throwaway spike type — production equivalent lives in Phase 3 (DISC-01).
+struct DiscoveredSonosDevice {
+    /// Unique Sonos identifier (USN header). Dedup key.
+    let usn: String
+    /// IPv4 address parsed from the LOCATION URL.
+    let ip: String
+    /// Sonos UPnP control port (always 1400 for S1).
+    let port: Int
+    /// Full LOCATION URL (e.g. http://192.168.x.x:1400/xml/device_description.xml).
+    let location: String
+    /// SERVER header (e.g. "Linux UPnP/1.0 Sonos/56.0-76060 (ZP100)").
+    let server: String
+    /// Room name extracted from the device description XML; nil until fetched.
+    var roomName: String?
+}
+
+// MARK: - DiscoveryCollector
+
+/// Actor wrapping the dedup dictionary so the receive handler (running on a
+/// global dispatch queue inside `NWConnectionGroup`) can safely insert without
+/// triggering Swift 6 strict-concurrency violations.
+actor DiscoveryCollector {
+    private(set) var devices: [String: DiscoveredSonosDevice] = [:]
+
+    func add(_ device: DiscoveredSonosDevice) {
+        if self.devices[device.usn] == nil {
+            self.devices[device.usn] = device
+        }
+    }
+
+    func snapshot() -> [DiscoveredSonosDevice] {
+        Array(self.devices.values)
+    }
+}
+
+// MARK: - Sonos Discovery Helpers (SPIKE-04)
+
+/// Parse an SSDP HTTP/1.1 200 OK response into a `DiscoveredSonosDevice`.
+///
+/// Returns nil if the payload is not a valid Sonos zone response (wrong status
+/// line, missing required headers, or non-ZonePlayer ST). Strictly defensive
+/// per threat model T-02-02 — no force unwraps on attacker-controlled bytes.
+func parseSSDPResponse(_ data: Data) -> DiscoveredSonosDevice? {
+    guard let text = String(data: data, encoding: .utf8) else { return nil }
+
+    // Split into lines on CRLF (UPnP/HTTP standard).
+    let lines = text.split(separator: "\r\n", omittingEmptySubsequences: false)
+    guard let firstLine = lines.first else { return nil }
+
+    // Status line must indicate success — case-insensitive match on the prefix.
+    guard firstLine.uppercased().hasPrefix("HTTP/1.1 200 OK") else { return nil }
+
+    // Parse headers: split each on first ":". Header names are case-insensitive
+    // per RFC 7230, so we lowercase the keys.
+    var headers: [String: String] = [:]
+    for line in lines.dropFirst() {
+        guard let colonIdx = line.firstIndex(of: ":") else { continue }
+        let key = line[..<colonIdx].trimmingCharacters(in: .whitespaces).lowercased()
+        let value = line[line.index(after: colonIdx)...]
+            .trimmingCharacters(in: .whitespaces)
+        if !key.isEmpty { headers[key] = value }
+    }
+
+    guard let location = headers["location"],
+          let usn = headers["usn"],
+          let st = headers["st"]
+    else { return nil }
+
+    // Filter to Sonos ZonePlayer responses — other UPnP devices on the LAN
+    // (printers, smart TVs, etc.) also reply to ssdp:all but never to a
+    // ZonePlayer-targeted M-SEARCH; this is a belt-and-braces check.
+    guard st.contains("ZonePlayer") else { return nil }
+
+    guard let url = URLComponents(string: location),
+          let host = url.host
+    else { return nil }
+    let port = url.port ?? 1400
+    let server = headers["server"] ?? ""
+
+    return DiscoveredSonosDevice(
+        usn: usn,
+        ip: host,
+        port: port,
+        location: location,
+        server: server,
+        roomName: nil
+    )
+}
+
+// MARK: - SonosRoomNameParser
+
+/// XMLParser delegate that captures the first `<roomName>` element value it
+/// encounters in a Sonos `device_description.xml` document.
+///
+/// Sonos devices have one `<roomName>` at the root device level plus nested
+/// service-level entries on subordinate devices; we only want the first one.
+private final class SonosRoomNameParser: NSObject, XMLParserDelegate {
+    private(set) var roomName: String?
+    private var capturing = false
+    private var buffer = ""
+
+    func parser(
+        _: XMLParser,
+        didStartElement elementName: String,
+        namespaceURI _: String?,
+        qualifiedName _: String?,
+        attributes _: [String: String] = [:]
+    ) {
+        if self.roomName == nil, elementName == "roomName" {
+            self.capturing = true
+            self.buffer = ""
+        }
+    }
+
+    func parser(_: XMLParser, foundCharacters string: String) {
+        if self.capturing { self.buffer.append(string) }
+    }
+
+    func parser(
+        _ parser: XMLParser,
+        didEndElement elementName: String,
+        namespaceURI _: String?,
+        qualifiedName _: String?
+    ) {
+        if self.capturing, elementName == "roomName" {
+            self.roomName = self.buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.capturing = false
+            // First match wins — abort parse to avoid wasted work on the rest
+            // of the (often >10 KB) device description.
+            parser.abortParsing()
+        }
+    }
+}
+
+/// Best-effort fetch of the room name for a discovered Sonos device.
+///
+/// GETs `device.location` (the device_description.xml URL) and parses out the
+/// first `<roomName>` element. Never throws past this boundary — any failure
+/// (HTTP error, oversized body, parse failure, missing tag) returns nil and
+/// the caller continues with `roomName: nil` per threat model T-02-03.
+func fetchRoomName(for device: DiscoveredSonosDevice) async -> String? {
+    guard let url = URL(string: device.location) else { return nil }
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "GET"
+    request.timeoutInterval = 3.0
+    request.cachePolicy = .reloadIgnoringLocalCacheData
+
+    let data: Data
+    let response: URLResponse
+    do {
+        (data, response) = try await URLSession.shared.data(for: request)
+    } catch {
+        return nil
+    }
+
+    // T-02-03: cap body at 256 KB. Real Sonos descriptions are ~10 KB.
+    guard data.count <= 256 * 1024 else { return nil }
+    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        return nil
+    }
+
+    let parser = XMLParser(data: data)
+    let delegate = SonosRoomNameParser()
+    parser.delegate = delegate
+    _ = parser.parse()
+    let name = delegate.roomName
+    return name?.isEmpty == true ? nil : name
+}
+
+/// Send SSDP M-SEARCH via Apple-blessed `NWConnectionGroup` + `NWMulticastGroup`.
+///
+/// Implements RESEARCH.md Section 3 "NWConnectionGroup setup shape" with the
+/// actor-wrapped dedup dictionary required by Swift 6 strict concurrency, the
+/// 65,535-byte receive cap from threat model T-02-02, and the 3-iterations-
+/// 1s-apart repetition discipline from RESEARCH.md "Repetition discipline".
+func sendSSDPMSearchViaNWConnectionGroup(
+    timeout: TimeInterval
+) async throws -> [DiscoveredSonosDevice] {
+    let multicast = try NWMulticastGroup(
+        for: [.hostPort(host: "239.255.255.250", port: 1900)]
+    )
+    let group = NWConnectionGroup(with: multicast, using: .udp)
+    let collector = DiscoveryCollector()
+
+    let mSearch = "M-SEARCH * HTTP/1.1\r\n"
+        + "HOST: 239.255.255.250:1900\r\n"
+        + "MAN: \"ssdp:discover\"\r\n"
+        + "MX: 3\r\n"
+        + "ST: urn:schemas-upnp-org:device:ZonePlayer:1\r\n"
+        + "\r\n"
+    guard let mSearchData = mSearch.data(using: .utf8) else {
+        throw SonosSpikeError.malformedResponse
+    }
+
+    group.setReceiveHandler(
+        maximumMessageSize: 65535,
+        rejectOversizedMessages: true
+    ) { _, content, _ in
+        guard let content,
+              let device = parseSSDPResponse(content)
+        else { return }
+        Task { await collector.add(device) }
+    }
+
+    group.start(queue: .global())
+    group.send(content: mSearchData) { _ in }
+    try await Task.sleep(for: .seconds(1))
+    group.send(content: mSearchData) { _ in }
+    try await Task.sleep(for: .seconds(1))
+    group.send(content: mSearchData) { _ in }
+    try await Task.sleep(for: .seconds(timeout))
+    group.cancel()
+
+    return await collector.snapshot()
+}
+
+/// Send SSDP M-SEARCH via raw BSD multicast socket. Fallback for the documented
+/// `NWConnectionGroup` unicast-response bug FB8461681 (RESEARCH.md Section 3 —
+/// "Documented edge case + BSD socket fallback").
+func sendSSDPMSearchViaBSDSocket(
+    timeout: TimeInterval
+) async throws -> [DiscoveredSonosDevice] {
+    let sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    guard sock >= 0 else { throw POSIXError(.EACCES) }
+    defer { close(sock) }
+
+    var ttl: Int32 = 4
+    _ = setsockopt(
+        sock, IPPROTO_IP, IP_MULTICAST_TTL,
+        &ttl, socklen_t(MemoryLayout<Int32>.size)
+    )
+
+    var loop: UInt8 = 1
+    _ = setsockopt(
+        sock, IPPROTO_IP, IP_MULTICAST_LOOP,
+        &loop, socklen_t(MemoryLayout<UInt8>.size)
+    )
+
+    var bindAddr = sockaddr_in()
+    bindAddr.sin_family = sa_family_t(AF_INET)
+    bindAddr.sin_port = 0 // ephemeral
+    bindAddr.sin_addr.s_addr = INADDR_ANY.bigEndian
+    let bindResult = withUnsafePointer(to: &bindAddr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+            bind(sock, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    guard bindResult == 0 else { throw POSIXError(.EADDRINUSE) }
+
+    // Non-blocking so the recvfrom loop can poll without blocking the task.
+    let flags = fcntl(sock, F_GETFL, 0)
+    _ = fcntl(sock, F_SETFL, flags | O_NONBLOCK)
+
+    var dest = sockaddr_in()
+    dest.sin_family = sa_family_t(AF_INET)
+    dest.sin_port = UInt16(1900).bigEndian
+    _ = "239.255.255.250".withCString { cstr in
+        inet_pton(AF_INET, cstr, &dest.sin_addr)
+    }
+
+    let mSearch = "M-SEARCH * HTTP/1.1\r\n"
+        + "HOST: 239.255.255.250:1900\r\n"
+        + "MAN: \"ssdp:discover\"\r\n"
+        + "MX: 3\r\n"
+        + "ST: urn:schemas-upnp-org:device:ZonePlayer:1\r\n"
+        + "\r\n"
+    let bytes = Array(mSearch.utf8)
+
+    func sendOnce() {
+        bytes.withUnsafeBufferPointer { buf in
+            withUnsafePointer(to: &dest) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    _ = sendto(
+                        sock, buf.baseAddress, buf.count, 0, sa,
+                        socklen_t(MemoryLayout<sockaddr_in>.size)
+                    )
+                }
+            }
+        }
+    }
+
+    // Send 3 M-SEARCH packets 1s apart.
+    sendOnce()
+    try await Task.sleep(for: .seconds(1))
+    sendOnce()
+    try await Task.sleep(for: .seconds(1))
+    sendOnce()
+
+    // Receive loop: poll non-blocking recvfrom every ~50ms until timeout.
+    var devices: [String: DiscoveredSonosDevice] = [:]
+    let deadline = Date().addingTimeInterval(timeout)
+    var recvBuf = [UInt8](repeating: 0, count: 65535)
+
+    while Date() < deadline {
+        var fromAddr = sockaddr_in()
+        var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let received = recvBuf.withUnsafeMutableBufferPointer { buf -> Int in
+            withUnsafeMutablePointer(to: &fromAddr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    recvfrom(sock, buf.baseAddress, buf.count, 0, sa, &fromLen)
+                }
+            }
+        }
+        if received > 0 {
+            let payload = Data(recvBuf.prefix(received))
+            if let device = parseSSDPResponse(payload), devices[device.usn] == nil {
+                devices[device.usn] = device
+            }
+        }
+        try await Task.sleep(for: .milliseconds(50))
+    }
+
+    return Array(devices.values)
+}
+
 // MARK: - Sonos Spike Subcommands (placeholders — bodies filled by plans 02–06)
 
-/// SPIKE-04 — SSDP M-SEARCH for Sonos S1 zones on the LAN. Body added in plan 02.
-func runSonosDiscover(args _: [String]) async {
-    print("🔍 SPIKE-04 — sonos discover (placeholder; see PLAN 02)")
-    exit(0)
+/// SPIKE-04 — SSDP M-SEARCH for Sonos S1 zones on the LAN.
+///
+/// Implements CONTEXT.md D-05: this CLI runs unsandboxed, so multicast send /
+/// receive works without the still-pending Apple multicast entitlement.
+///
+/// Exit codes:
+/// - 0 → GO: NWConnectionGroup discovered ≥1 device
+/// - 1 → NO-GO: zero devices on either transport
+/// - 2 → GO-WITH-WORKAROUND: NWConnectionGroup found nothing but BSD did
+func runSonosDiscover(args: [String]) async {
+    var timeout = 5
+    var useBSDFallback = false
+    var verbose = false
+    var i = 0
+    while i < args.count {
+        switch args[i] {
+        case "--timeout":
+            if i + 1 < args.count, let parsed = Int(args[i + 1]) {
+                timeout = max(3, min(30, parsed))
+                i += 2
+            } else {
+                print("❌ --timeout requires an integer 3..30")
+                exit(1)
+            }
+        case "--bsd":
+            useBSDFallback = true
+            i += 1
+        case "--verbose", "-v":
+            verbose = true
+            i += 1
+        default:
+            i += 1
+        }
+    }
+
+    print("🔍 SPIKE-04 — SSDP discovery on 239.255.255.250:1900")
+    print("   Transport: \(useBSDFallback ? "BSD socket fallback" : "NWConnectionGroup")")
+    print("   Timeout:   \(timeout)s")
+    if let lanIP = detectMacLANIP() {
+        print("   Mac LAN IP: \(lanIP)")
+    }
+    print("")
+
+    do {
+        var devices = useBSDFallback
+            ? try await sendSSDPMSearchViaBSDSocket(timeout: TimeInterval(timeout))
+            : try await sendSSDPMSearchViaNWConnectionGroup(timeout: TimeInterval(timeout))
+
+        // Auto-fallback heuristic: if NWConnectionGroup returned 0 devices,
+        // try BSD and exit with code 2 (go-with-workaround) if BSD finds them.
+        var goWithWorkaround = false
+        if devices.isEmpty, !useBSDFallback {
+            print("⚠️  NWConnectionGroup returned 0 devices — auto-trying BSD socket fallback...")
+            devices = try await sendSSDPMSearchViaBSDSocket(timeout: TimeInterval(timeout))
+            if !devices.isEmpty {
+                goWithWorkaround = true
+                print("⚠️  BSD socket found \(devices.count) device(s) — FB8461681 likely still bites macOS 26")
+            }
+        }
+
+        if devices.isEmpty {
+            print("❌ NO-GO: zero devices responded from either transport")
+            print("   Diagnostic: try `sudo tcpdump -i any port 1900` while re-running this command")
+            print("   to see whether M-SEARCH packets actually leave the Mac (RESEARCH.md Pitfall 5)")
+            exit(1)
+        }
+
+        // Fetch room names for each device (best-effort, parallel).
+        await withTaskGroup(of: (Int, String?).self) { taskGroup in
+            for (idx, device) in devices.enumerated() {
+                taskGroup.addTask { await (idx, fetchRoomName(for: device)) }
+            }
+            for await (idx, name) in taskGroup {
+                devices[idx].roomName = name
+            }
+        }
+
+        let verdict = goWithWorkaround ? "GO-WITH-WORKAROUND" : "GO"
+        print("✅ \(verdict): discovered \(devices.count) Sonos device(s):")
+        for device in devices {
+            let name = device.roomName ?? "(roomName unknown)"
+            print("   • \(name) — \(device.ip):\(device.port)")
+            if verbose {
+                print("       USN:    \(device.usn)")
+                print("       SERVER: \(device.server)")
+                print("       LOCATION: \(device.location)")
+            }
+        }
+        exit(goWithWorkaround ? 2 : 0)
+    } catch {
+        print("❌ NO-GO: \(error)")
+        exit(1)
+    }
 }
 
 /// SPIKE-03 — Serve test fixture, drive Sonos via SOAP. Body added in plan 03.
