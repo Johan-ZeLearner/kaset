@@ -32,7 +32,7 @@ Decimal phases appear between their surrounding integers in numeric order.
   5. Spike report committed at `.planning/phases/01-spike/REPORT.md` with explicit go/no-go on each of SPIKE-02 / SPIKE-03 / SPIKE-04 / SPIKE-05 plus chosen encoder format (AAC-in-ADTS / WAV / vendor-LAME-with-approval) and SSDP transport decision (`NWConnectionGroup` vs BSD socket fallback)
 **Plans**: 6 plans
   - [x] 01-01-PLAN.md — Day-1 entitlement filing + api-explorer `sonos` dispatcher scaffold + WAV/AAC fixtures
-  - [ ] 01-02-PLAN.md — SPIKE-04 SSDP discovery via NWConnectionGroup with BSD socket fallback
+  - [x] 01-02-PLAN.md — SPIKE-04 SSDP discovery via NWConnectionGroup with BSD socket fallback
   - [ ] 01-03-PLAN.md — SPIKE-03 NWListener HTTP/1.0 relay + SOAP-driven Sonos playback (WAV first, AAC second)
   - [ ] 01-04-PLAN.md — SPIKE-02 dual-consumer tap test via in-place fan-out at EqualizerAudioEngine.performRender (gated by #if SPIKE_TAP_COEXIST)
   - [ ] 01-05-PLAN.md — SPIKE-05 5-trial manual-stopwatch pause-to-silence latency measurement
@@ -102,7 +102,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Spike | 1/6 | In Progress|  |
+| 1. Spike | 2/6 | In Progress|  |
 | 2. Foundation Refactor | 0/TBD | Not started | - |
 | 3. Discovery + Control Plane | 0/TBD | Not started | - |
 | 4. Audio Capture + HTTP Relay | 0/TBD | Not started | - |
