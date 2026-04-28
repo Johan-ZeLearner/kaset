@@ -33,8 +33,10 @@
 //
 
 import CommonCrypto
+import Darwin
 import Dispatch
 import Foundation
+import Network
 
 // MARK: - Configuration
 
@@ -1337,6 +1339,188 @@ func showHelp() {
     )
 }
 
+// MARK: - SonosService
+
+/// Sonos UPnP service the SOAP request targets.
+/// Throwaway spike type — production equivalent lives in Phase 3.
+enum SonosService {
+    case avTransport
+    case renderingControl
+}
+
+// MARK: - SonosSpikeError
+
+/// Errors surfaced by the Sonos spike helpers.
+/// Throwaway: production code uses typed `SonosError` (Phase 3).
+enum SonosSpikeError: Error, CustomStringConvertible {
+    case invalidURL(String)
+    case soapFault(String)
+    case httpStatus(Int)
+    case malformedResponse
+    case lanIPNotFound
+
+    var description: String {
+        switch self {
+        case let .invalidURL(value): "invalid URL: \(value)"
+        case let .soapFault(message): "Sonos SOAP fault: \(message)"
+        case let .httpStatus(code): "Sonos HTTP \(code)"
+        case .malformedResponse: "malformed Sonos response"
+        case .lanIPNotFound: "could not detect LAN IP via getifaddrs"
+        }
+    }
+}
+
+// MARK: - Sonos Spike Helpers
+
+/// Send a SOAP POST to a Sonos zone's UPnP control endpoint.
+///
+/// Mirrors RESEARCH.md "Verified pattern: SOAP POST helper" with proper
+/// optional unwrapping (no force unwraps per CLAUDE.md). Used by plans 03/05
+/// once the placeholder bodies are filled in.
+func sendSonosSOAP(
+    host: String,
+    service: SonosService,
+    action: String,
+    bodyXML: String
+) async throws -> Data {
+    let endpoint = service == .avTransport
+        ? "MediaRenderer/AVTransport/Control"
+        : "MediaRenderer/RenderingControl/Control"
+    let serviceURN = service == .avTransport
+        ? "urn:schemas-upnp-org:service:AVTransport:1"
+        : "urn:schemas-upnp-org:service:RenderingControl:1"
+
+    let urlString = "http://\(host):1400/\(endpoint)"
+    guard let url = URL(string: urlString) else {
+        throw SonosSpikeError.invalidURL(urlString)
+    }
+
+    let envelope = """
+    <?xml version="1.0" encoding="utf-8"?>
+    <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
+      <s:Body>
+    \(bodyXML)
+      </s:Body>
+    </s:Envelope>
+    """
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    // SOAP should fail loud, not stall — short timeout per RESEARCH.md.
+    request.timeoutInterval = 3.0
+    request.setValue("text/xml; charset=\"utf-8\"", forHTTPHeaderField: "Content-Type")
+    // Literal double quotes around the SOAPACTION value are required by Sonos
+    // S1 firmware (RESEARCH.md PITFALLS Pitfall 1).
+    request.setValue("\"\(serviceURN)#\(action)\"", forHTTPHeaderField: "SOAPACTION")
+    request.setValue("close", forHTTPHeaderField: "Connection")
+    request.httpBody = envelope.data(using: .utf8)
+
+    let (data, response) = try await URLSession.shared.data(for: request)
+
+    guard let http = response as? HTTPURLResponse else {
+        throw SonosSpikeError.malformedResponse
+    }
+
+    // Per RESEARCH.md PITFALLS Pitfall 1: SOAP encodes errors at the body
+    // level, not via HTTP status. Check the body for fault markers BEFORE
+    // trusting a 200.
+    if let bodyString = String(data: data, encoding: .utf8),
+       bodyString.contains("<s:Fault>") || bodyString.contains("<errorCode>")
+    {
+        throw SonosSpikeError.soapFault(String(bodyString.prefix(500)))
+    }
+
+    guard http.statusCode == 200 else {
+        throw SonosSpikeError.httpStatus(http.statusCode)
+    }
+
+    return data
+}
+
+/// Best-effort detection of the Mac's LAN IPv4 address.
+///
+/// Iterates `getifaddrs()` for non-loopback IPv4 addresses on `en*`
+/// interfaces (Wi-Fi/Ethernet) and prefers RFC-1918 ranges. Returns `nil`
+/// if no candidate is found — callers should fall back to a `--mac-ip`
+/// CLI override per RESEARCH.md Section 5.
+///
+/// Used by plan 03 (`runSonosPlay`) to advertise the spike HTTP listener
+/// to Sonos, and by plan 05 indirectly via the same playback flow.
+func detectMacLANIP() -> String? {
+    var ifaddrPtr: UnsafeMutablePointer<ifaddrs>?
+    guard getifaddrs(&ifaddrPtr) == 0, let firstAddr = ifaddrPtr else {
+        return nil
+    }
+    defer { freeifaddrs(ifaddrPtr) }
+
+    var candidates: [String] = []
+    var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
+    while let current = ptr {
+        defer { ptr = current.pointee.ifa_next }
+        guard let addr = current.pointee.ifa_addr else { continue }
+        guard addr.pointee.sa_family == sa_family_t(AF_INET) else { continue }
+
+        let name = String(cString: current.pointee.ifa_name)
+        // Skip loopback, awdl, utun, llw — keep only en0/en1/etc.
+        guard name.hasPrefix("en") else { continue }
+
+        var hostBuf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let result = getnameinfo(
+            addr,
+            socklen_t(addr.pointee.sa_len),
+            &hostBuf,
+            socklen_t(hostBuf.count),
+            nil,
+            0,
+            NI_NUMERICHOST
+        )
+        if result == 0 {
+            // Truncate at the first NUL, then decode the leading bytes as UTF-8.
+            // (Replaces deprecated `String(cString:)` on [CChar] in macOS 26+.)
+            let nulIndex = hostBuf.firstIndex(of: 0) ?? hostBuf.endIndex
+            let bytes = hostBuf[..<nulIndex].map { UInt8(bitPattern: $0) }
+            let ip = String(decoding: bytes, as: UTF8.self)
+            // Heuristic: prefer RFC-1918 LAN ranges over link-local etc.
+            if ip.hasPrefix("192.168.") || ip.hasPrefix("10.") || ip.hasPrefix("172.") {
+                candidates.append(ip)
+            }
+        }
+    }
+    return candidates.first
+}
+
+// MARK: - Sonos Spike Subcommands (placeholders — bodies filled by plans 02–06)
+
+/// SPIKE-04 — SSDP M-SEARCH for Sonos S1 zones on the LAN. Body added in plan 02.
+func runSonosDiscover(args _: [String]) async {
+    print("🔍 SPIKE-04 — sonos discover (placeholder; see PLAN 02)")
+    exit(0)
+}
+
+/// SPIKE-03 — Serve test fixture, drive Sonos via SOAP. Body added in plan 03.
+func runSonosPlay(args _: [String]) async {
+    print("📻 SPIKE-03 — sonos play (placeholder; see PLAN 03)")
+    exit(0)
+}
+
+/// SPIKE-02 — Dual-consumer tap coexistence test. Body added in plan 04.
+func runSonosTapCoexist(args _: [String]) async {
+    print("🎚 SPIKE-02 — sonos tap-coexist (placeholder; see PLAN 04)")
+    exit(0)
+}
+
+/// SPIKE-05 — Pause-to-silence latency, 5 trials. Body added in plan 05.
+func runSonosMeasureLatency(args _: [String]) async {
+    print("⏱  SPIKE-05 — sonos measure-latency (placeholder; see PLAN 05)")
+    exit(0)
+}
+
+/// SPIKE-06 — Run all four bets sequentially, write REPORT.md. Body added in plan 06.
+func runSonosSpikeAll(args _: [String]) async {
+    print("🧪 SPIKE-06 — sonos spike-all (placeholder; see PLAN 06)")
+    exit(0)
+}
+
 // MARK: - Main Entry Point
 
 func runMain() async {
@@ -1438,6 +1622,28 @@ func runMain() async {
 
     case "brandaccounts":
         await discoverBrandAccounts(verbose: verbose)
+
+    case "sonos":
+        guard filteredArgs.count >= 2 else {
+            print("❌ Usage: sonos <discover|play|tap-coexist|measure-latency|spike-all> [args]")
+            print("   discover             — SPIKE-04: SSDP M-SEARCH for Sonos S1 zones on the LAN")
+            print("   play <ip>            — SPIKE-03: serve test fixture, SOAP-control playback")
+            print("   tap-coexist <id>     — SPIKE-02: dual-consumer tap test (videoId)")
+            print("   measure-latency <ip> — SPIKE-05: pause-to-silence latency, 5 trials")
+            print("   spike-all <ip>       — Run all four bets sequentially, write REPORT.md")
+            return
+        }
+        let sonosArgs = Array(filteredArgs.dropFirst(2))
+        switch filteredArgs[1] {
+        case "discover": await runSonosDiscover(args: sonosArgs)
+        case "play": await runSonosPlay(args: sonosArgs)
+        case "tap-coexist": await runSonosTapCoexist(args: sonosArgs)
+        case "measure-latency": await runSonosMeasureLatency(args: sonosArgs)
+        case "spike-all": await runSonosSpikeAll(args: sonosArgs)
+        default:
+            print("❌ Unknown sonos subcommand: \(filteredArgs[1])")
+            print("   Valid: discover, play, tap-coexist, measure-latency, spike-all")
+        }
 
     case "help", "-h", "--help":
         showHelp()
